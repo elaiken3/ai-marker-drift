@@ -68,12 +68,16 @@ def count_markers(text: str, cfg: dict, phrase_patterns: dict) -> dict:
     return counts
 
 
-def month_key(date_str: str) -> str:
-    # dates come in as YYYY, YYYY-MM, or YYYY-MM-DD -- normalize to YYYY-MM
+def month_key(date_str: str) -> str | None:
+    # dates come in as YYYY, YYYY-MM, or YYYY-MM-DD. Year-only dates have no
+    # month, so they can't be placed on a monthly axis -- return None so the
+    # caller drops them instead of silently piling them into January (PubMed
+    # emits ~20k year-only records per year; binning them to Jan created a huge
+    # spurious annual spike that broke every marker AND every control).
     parts = date_str.split("-")
-    if len(parts) >= 2:
+    if len(parts) >= 2 and parts[1]:
         return f"{parts[0]}-{parts[1]}"
-    return f"{parts[0]}-01"
+    return None
 
 
 def quantile_suffix(q: float) -> str:
@@ -112,6 +116,13 @@ def main():
         help="optional path to also dump a long per-document table "
              "(id, month, {marker}_per_1k_words...) for ad-hoc analysis",
     )
+    ap.add_argument(
+        "--min-docs",
+        type=int,
+        default=0,
+        help="drop months with fewer than this many documents (removes sparse "
+             "edge months that add noise to the regression); default 0 = keep all",
+    )
     args = ap.parse_args()
 
     cfg = load_markers(args.markers)
@@ -132,6 +143,7 @@ def main():
     perdoc_rows = []  # only populated when --per-doc-out is set
 
     n_docs = 0
+    n_year_only = 0  # dropped: no month, can't be placed on a monthly axis
     with open(args.infile) as f:
         for line in f:
             line = line.strip()
@@ -146,11 +158,15 @@ def main():
             if not text or not date:
                 continue
 
+            mk = month_key(date)
+            if mk is None:
+                n_year_only += 1
+                continue
+
             wc = word_count(text)
             if wc == 0:
                 continue
 
-            mk = month_key(date)
             counts = count_markers(text, cfg, phrase_patterns)
             perdoc_row = {"id": rec.get("id"), "month": mk}
             for name, c in counts.items():
@@ -166,7 +182,11 @@ def main():
             n_docs += 1
 
     rows = []
+    n_sparse_months = 0
     for mk in sorted(monthly_word_counts.keys()):
+        if monthly_doc_counts[mk] < args.min_docs:
+            n_sparse_months += 1
+            continue
         row = {
             "month": mk,
             "n_docs": monthly_doc_counts[mk],
@@ -187,6 +207,10 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_path, index=False)
     print(f"Processed {n_docs} docs across {len(rows)} months -> {out_path}")
+    if n_year_only:
+        print(f"Dropped {n_year_only} year-only records (no month; can't bin to a monthly axis)")
+    if n_sparse_months:
+        print(f"Dropped {n_sparse_months} month(s) with < {args.min_docs} docs (--min-docs)")
 
     if args.perdoc_out:
         perdoc_path = Path(args.perdoc_out)
