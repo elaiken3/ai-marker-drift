@@ -36,6 +36,29 @@ def rate_limit_sleep():
     time.sleep(0.11 if get_api_key() else 0.35)
 
 
+def eutils_get_json(endpoint: str, params: dict, retries: int = 3) -> dict:
+    """GET an E-utilities endpoint and parse JSON tolerantly.
+
+    NCBI occasionally emits JSON containing raw (unescaped) control characters
+    -- most often in the echoed query translation. requests' .json() parses in
+    strict mode and rejects those with 'Invalid control character', so parse
+    with strict=False instead. Transient dirty/truncated bodies are retried
+    with backoff.
+    """
+    last_err = None
+    for attempt in range(retries):
+        r = requests.get(f"{EUTILS_BASE}/{endpoint}", params=params, timeout=30)
+        r.raise_for_status()
+        try:
+            return json.loads(r.text, strict=False)
+        except json.JSONDecodeError as e:
+            last_err = e
+            time.sleep(2 ** attempt)
+    raise RuntimeError(
+        f"E-utilities {endpoint} returned unparseable JSON after {retries} attempts: {last_err}"
+    )
+
+
 def esearch_all_ids(query: str, start: str, end: str) -> list[str]:
     """Use esearch with history (usehistory=y) to page through all matching PMIDs."""
     params = {
@@ -51,9 +74,7 @@ def esearch_all_ids(query: str, start: str, end: str) -> list[str]:
     if get_api_key():
         params["api_key"] = get_api_key()
 
-    r = requests.get(f"{EUTILS_BASE}/esearch.fcgi", params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()["esearchresult"]
+    data = eutils_get_json("esearch.fcgi", params)["esearchresult"]
     total = int(data["count"])
     webenv = data["webenv"]
     query_key = data["querykey"]
@@ -71,9 +92,7 @@ def esearch_all_ids(query: str, start: str, end: str) -> list[str]:
         }
         if get_api_key():
             params["api_key"] = get_api_key()
-        r = requests.get(f"{EUTILS_BASE}/esearch.fcgi", params=params, timeout=30)
-        r.raise_for_status()
-        ids.extend(r.json()["esearchresult"]["idlist"])
+        ids.extend(eutils_get_json("esearch.fcgi", params)["esearchresult"]["idlist"])
         rate_limit_sleep()
 
     return ids
