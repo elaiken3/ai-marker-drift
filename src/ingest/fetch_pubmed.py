@@ -28,6 +28,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -181,11 +182,34 @@ def parse_efetch_xml(content: bytes) -> list[dict]:
     return records
 
 
-def efetch_from_history(webenv: str, query_key: str, retstart: int, retmax: int) -> list[dict]:
+# Characters legal in XML 1.0 are tab/newline/CR and the printable ranges; a stray
+# control char or bad byte in a PubMed abstract makes the whole response
+# not-well-formed. Strip anything outside the legal set before reparsing.
+_ILLEGAL_XML = re.compile(
+    "[^\x09\x0A\x0D\x20-\uD7FF\uE000-\uFFFD\U00010000-\U0010FFFF]"
+)
+
+
+def sanitize_xml(content: bytes) -> bytes:
+    """Drop illegal XML characters/bad bytes so a reparse can succeed. Returns
+    bytes (not str) so the XML encoding declaration still parses."""
+    text = content.decode("utf-8", errors="replace")
+    return _ILLEGAL_XML.sub("", text).encode("utf-8")
+
+
+def efetch_from_history(webenv: str, query_key: str, retstart: int, retmax: int,
+                        retries: int = 4) -> list[dict]:
     """Fetch one page of records directly from the history server.
 
     Unlike esearch, efetch from history has no 9,999-record limit, so this pages
     through arbitrarily large result sets via retstart/retmax.
+
+    NCBI occasionally returns a 200 whose body is not well-formed XML -- either
+    truncated mid-document or carrying an illegal character. Recover rather than
+    crash a multi-hour pull: try the raw body, then a sanitized copy (fixes bad
+    chars), then re-fetch (fixes truncation). If a batch stays malformed after
+    `retries`, skip it with a loud warning (bounded, logged loss of <= retmax
+    records) so the pull can finish.
     """
     params = {
         "db": "pubmed",
@@ -199,8 +223,24 @@ def efetch_from_history(webenv: str, query_key: str, retstart: int, retmax: int)
     if get_api_key():
         params["api_key"] = get_api_key()
 
-    r = http_get("efetch.fcgi", params, timeout=120)
-    return parse_efetch_xml(r.content)
+    last_err = None
+    for attempt in range(retries):
+        content = http_get("efetch.fcgi", params, timeout=120).content
+        try:
+            return parse_efetch_xml(content)
+        except ET.ParseError as e:
+            last_err = e
+        try:
+            return parse_efetch_xml(sanitize_xml(content))
+        except ET.ParseError as e:
+            last_err = e  # likely truncated; re-fetch below
+        time.sleep(2 ** attempt)
+
+    print(
+        f"  WARNING: efetch batch at retstart={retstart} stayed malformed after "
+        f"{retries} attempts ({last_err}); skipping up to {retmax} records."
+    )
+    return []
 
 
 def _fetch_small_slice(webenv: str, query_key: str, count: int, out_handle) -> int:
