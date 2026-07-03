@@ -13,7 +13,18 @@ Verified working end-to-end on synthetic data:
 - `src/analysis/extract_features.py` — tokenizes a jsonl corpus, computes
   per-1,000-word marker frequency (word-boundary regex matching for phrases),
   aggregates to monthly CSV. Confirmed correct on synthetic data with a
-  known injected break.
+  known injected break. Also emits per-month quantiles of the *per-document*
+  frequency distribution (`{marker}_pQQ_per_1k_words`, default p50/p75/p90/p95)
+  plus an optional `--per-doc-out` long table — this is the H2 (avoidance)
+  right-tail support. Named to reuse the `{marker}_per_1k_words` convention, so
+  the 90th-pct series feeds `regression_discontinuity.py` via `--marker em_dash_p90`
+  with no downstream change. Verified on synthetic data where the per-doc tail
+  shrinks post-break while the monthly mean stays ~flat.
+- `src/analysis/detect_breaks.py` — automated (Bai-Perron-style) changepoint
+  detection via `ruptures` (Dynp for a fixed count, Pelt for data-driven), which
+  reports detected breaks and the nearest one's distance from a reference date
+  (default Nov 2022). Verified on synthetic data: recovers an injected level
+  shift within ~1 month of its true location.
 - `src/analysis/regression_discontinuity.py` — segmented regression with
   Newey-West (HAC) standard errors + robust Wald break test, plus placebo
   breakpoint tests run on pre-break data only. Verified: detects the injected
@@ -42,14 +53,28 @@ Not yet run against real data:
   Ngram endpoint. Also: confirmed via research that Ngram's public corpus
   only runs through ~2022, so it's only useful as a pre-ChatGPT baseline,
   not for measuring the actual break.
+- `src/ingest/fetch_guardian.py` — Guardian Open Platform Content API ingest
+  (journalism leg). Same `{id, date, text}` jsonl contract, so it drops into
+  `extract_features.py` unchanged. Needs a free `GUARDIAN_API_KEY` (free tier
+  ~1 req/s, 500/day). The pure `parse_item()` helper is unit-tested offline
+  (date truncation, bodyText extraction, skip-on-empty), but the live paged
+  pull has NOT been run — the network block below covers this endpoint too, so
+  sanity-check a page of real results before trusting a full pull.
+
+Network note (this session): the remote-execution network policy allowlists
+only package registries (PyPI etc.) and internal ranges — `eutils.ncbi.nlm.nih.gov`,
+Google Ngram, and `content.guardianapis.com` all return proxy 403. So every
+*live* corpus pull remains untested here; run those from a machine/session with
+open network access. `ruptures` installs fine from PyPI, so detect_breaks was
+verified for real.
 
 ## Immediate next steps (in priority order)
 1. Run `fetch_pubmed.py` on a small query/date range first (e.g. one month)
    to confirm the XML parsing holds up, before committing to a big pull.
-2. Wire up a second corpus for a non-academic comparison point — NYT or
-   Guardian API is the natural pick for "journalism," since that's the other
-   domain in the original theory. Same `{id, date, text}` jsonl contract,
-   drops straight into `extract_features.py` with no changes needed there.
+2. Run `fetch_guardian.py` (journalism leg, now scaffolded) on a small
+   query/date range to sanity-check the live paged pull and `parse_item`
+   against real records, then use it as the non-academic comparison corpus.
+   (NYT remains an alternative second journalism source if wanted.)
 3. Decide on the actual query/topic scope for PubMed — "cancer AND treatment"
    in the README is a placeholder. Pick a topic-stable field (topic drift
    over years is one of the confounds noted below) with high enough monthly
@@ -70,15 +95,14 @@ Not yet run against real data:
   there than in less-edited web text; don't over-generalize from PubMed alone
 
 ## Improvements identified but NOT yet implemented
-- Bai-Perron automated break detection (`ruptures` library) — finding a break
-  near Nov 2022 without specifying the date is stronger evidence than testing
-  a hypothesized date
-- Per-document distribution analysis — H2 (avoidance) predicts the right tail
-  of per-doc em-dash counts shrinking even if the mean barely moves; current
-  monthly aggregation discards that. Needs extract_features to also emit
-  per-doc counts (or quantiles per month).
 - Checkpoint/resume in fetch_pubmed.py for long pulls
-- NYT/Guardian ingest scripts (journalism leg of the theory)
+- NYT ingest script (second journalism source alongside Guardian)
+
+## Improvements implemented (see verified list above)
+- Bai-Perron automated break detection — `src/analysis/detect_breaks.py`
+- Per-document distribution analysis (H2 right tail) — quantile columns in
+  `extract_features.py`
+- Guardian ingest (journalism leg) — `src/ingest/fetch_guardian.py`
 
 ## Design decisions already made, don't relitigate without reason
 - Frequency normalized per 1,000 words, not raw counts (controls doc length)

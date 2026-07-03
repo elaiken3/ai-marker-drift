@@ -1,9 +1,9 @@
 # Markers to track. Each entry is matched case-insensitively.
-# type: "punct" markers are counted as raw character/token occurrences.
-# type: "phrase" markers are matched as substrings on lowercased text
-#   (simple and fast; swap for regex word-boundaries if you see false positives,
-#   e.g. "nuance" matching inside "nuanced" is usually fine, "delve" inside a
-#   proper noun would not be).
+# "punct" markers are counted as raw character/token occurrences.
+# "phrases" (and "controls") are matched with word-boundary regex on
+#   lowercased text (see extract_features.compile_phrase_patterns), so "boast"
+#   won't match inside "boastful" -- add both stems explicitly if you want them
+#   (e.g. "nuanced" is listed separately from a bare "nuance").
 
 punct:
   - em_dash        # — (U+2014)

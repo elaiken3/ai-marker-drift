@@ -3,11 +3,22 @@ Read a jsonl corpus (output of an ingest script; one doc per line with
 {"id", "date", "text"}), compute per-1,000-word frequency for each marker
 in config/markers.yaml, and aggregate to a monthly time series.
 
+As well as the monthly mean-based frequency ({marker}_per_1k_words), this
+emits monthly quantiles of the *per-document* frequency distribution
+({marker}_pQQ_per_1k_words, e.g. em_dash_p90_per_1k_words). Those tail
+columns exist for hypothesis H2 (avoidance): if writers start trimming a
+marker once it's a recognized "AI tell", the right tail of the per-doc
+distribution shrinks even when the monthly mean barely moves. Because the
+quantile columns follow the same {marker}_per_1k_words naming convention,
+they drop straight into regression_discontinuity.py via --marker em_dash_p90.
+
 Usage:
     python src/analysis/extract_features.py \
         --in data/raw/pubmed_cancer.jsonl \
         --out data/processed/pubmed_cancer_monthly.csv \
-        --markers config/markers.yaml
+        --markers config/markers.yaml \
+        --quantiles 0.5,0.75,0.9,0.95 \
+        --per-doc-out data/processed/pubmed_cancer_perdoc.csv   # optional
 """
 import argparse
 import json
@@ -15,6 +26,7 @@ import re
 from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import yaml
 
@@ -64,11 +76,42 @@ def month_key(date_str: str) -> str:
     return f"{parts[0]}-01"
 
 
+def quantile_suffix(q: float) -> str:
+    """0.9 -> 'p90', 0.5 -> 'p50', 0.975 -> 'p98' (rounded to integer pct)."""
+    return f"p{int(round(q * 100))}"
+
+
+def parse_quantiles(spec: str) -> list[float]:
+    qs = []
+    for tok in spec.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        q = float(tok)
+        if not 0.0 <= q <= 1.0:
+            raise SystemExit(f"quantile {q} out of range [0, 1]")
+        qs.append(q)
+    return qs
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--in", dest="infile", required=True)
     ap.add_argument("--out", dest="outfile", required=True)
     ap.add_argument("--markers", default="config/markers.yaml")
+    ap.add_argument(
+        "--quantiles",
+        default="0.5,0.75,0.9,0.95",
+        help="comma-separated per-doc frequency quantiles to emit per month "
+             "(as {marker}_pQQ_per_1k_words columns); pass '' to skip",
+    )
+    ap.add_argument(
+        "--per-doc-out",
+        dest="perdoc_out",
+        default=None,
+        help="optional path to also dump a long per-document table "
+             "(id, month, {marker}_per_1k_words...) for ad-hoc analysis",
+    )
     args = ap.parse_args()
 
     cfg = load_markers(args.markers)
@@ -78,11 +121,15 @@ def main():
         + list(cfg.get("controls", []))
     )
     phrase_patterns = compile_phrase_patterns(cfg)
+    quantiles = parse_quantiles(args.quantiles)
 
     # monthly accumulators
     monthly_marker_counts = defaultdict(lambda: defaultdict(int))
     monthly_word_counts = defaultdict(int)
     monthly_doc_counts = defaultdict(int)
+    # per-doc per-1k frequencies, kept per month for quantile computation
+    monthly_perdoc_freq = defaultdict(lambda: defaultdict(list))
+    perdoc_rows = []  # only populated when --per-doc-out is set
 
     n_docs = 0
     with open(args.infile) as f:
@@ -105,8 +152,15 @@ def main():
 
             mk = month_key(date)
             counts = count_markers(text, cfg, phrase_patterns)
+            perdoc_row = {"id": rec.get("id"), "month": mk}
             for name, c in counts.items():
                 monthly_marker_counts[mk][name] += c
+                doc_freq = (c / wc) * 1000
+                monthly_perdoc_freq[mk][name].append(doc_freq)
+                if args.perdoc_out:
+                    perdoc_row[f"{name}_per_1k_words"] = doc_freq
+            if args.perdoc_out:
+                perdoc_rows.append(perdoc_row)
             monthly_word_counts[mk] += wc
             monthly_doc_counts[mk] += 1
             n_docs += 1
@@ -122,6 +176,10 @@ def main():
             raw = monthly_marker_counts[mk].get(name, 0)
             row[f"{name}_per_1k_words"] = (raw / monthly_word_counts[mk]) * 1000
             row[f"{name}_raw"] = raw
+            doc_freqs = monthly_perdoc_freq[mk].get(name, [])
+            for q in quantiles:
+                col = f"{name}_{quantile_suffix(q)}_per_1k_words"
+                row[col] = float(np.quantile(doc_freqs, q)) if doc_freqs else 0.0
         rows.append(row)
 
     df = pd.DataFrame(rows)
@@ -129,6 +187,12 @@ def main():
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(out_path, index=False)
     print(f"Processed {n_docs} docs across {len(rows)} months -> {out_path}")
+
+    if args.perdoc_out:
+        perdoc_path = Path(args.perdoc_out)
+        perdoc_path.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(perdoc_rows).to_csv(perdoc_path, index=False)
+        print(f"Wrote {len(perdoc_rows)} per-doc rows -> {perdoc_path}")
 
 
 if __name__ == "__main__":
