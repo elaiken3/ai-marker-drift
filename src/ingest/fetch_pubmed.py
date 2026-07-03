@@ -59,8 +59,15 @@ def eutils_get_json(endpoint: str, params: dict, retries: int = 3) -> dict:
     )
 
 
-def esearch_all_ids(query: str, start: str, end: str) -> list[str]:
-    """Use esearch with history (usehistory=y) to page through all matching PMIDs."""
+def esearch_history(query: str, start: str, end: str) -> tuple[int, str, str]:
+    """Post the query to NCBI's history server and return (total, WebEnv, query_key).
+
+    We deliberately do NOT page esearch to collect PMIDs: esearch can only reach
+    the first 9,999 records of a query (retstart > 9998 is rejected), so any query
+    with more results than that cannot be fully listed this way. Instead we store
+    the result set on the history server and efetch straight from it (see
+    efetch_from_history), which has no such ceiling.
+    """
     params = {
         "db": "pubmed",
         "term": query,
@@ -75,52 +82,10 @@ def esearch_all_ids(query: str, start: str, end: str) -> list[str]:
         params["api_key"] = get_api_key()
 
     data = eutils_get_json("esearch.fcgi", params)["esearchresult"]
-    total = int(data["count"])
-    webenv = data["webenv"]
-    query_key = data["querykey"]
-
-    ids = []
-    retmax = 10000
-    for retstart in tqdm(range(0, total, retmax), desc="esearch paging"):
-        params = {
-            "db": "pubmed",
-            "query_key": query_key,
-            "WebEnv": webenv,
-            "retstart": retstart,
-            "retmax": retmax,
-            "retmode": "json",
-        }
-        if get_api_key():
-            params["api_key"] = get_api_key()
-        ids.extend(esearch_page_idlist(params, retstart))
-        rate_limit_sleep()
-
-    return ids
-
-
-def esearch_page_idlist(params: dict, retstart: int, retries: int = 4) -> list[str]:
-    """Fetch one page of PMIDs, retrying transient NCBI errors.
-
-    Occasionally NCBI returns an esearchresult with no 'idlist' -- an ERROR or
-    WarningList payload instead of results -- even when the query is valid.
-    Retry those with backoff; if it persists, raise with NCBI's own message so
-    the failure is diagnosable instead of a bare KeyError.
-    """
-    result = {}
-    for attempt in range(retries):
-        result = eutils_get_json("esearch.fcgi", params)["esearchresult"]
-        if "idlist" in result:
-            return result["idlist"]
-        time.sleep(2 ** attempt)
-    problem = {
-        k: result[k]
-        for k in ("ERROR", "WarningList", "warninglist", "ERRORLIST", "errorlist")
-        if k in result
-    }
-    raise RuntimeError(
-        f"esearch page at retstart={retstart} returned no idlist after {retries} "
-        f"attempts. NCBI response: {problem or result}"
-    )
+    if "count" not in data or "webenv" not in data:
+        problem = {k: data[k] for k in ("ERROR", "WarningList", "errorlist") if k in data}
+        raise RuntimeError(f"esearch did not return a usable history handle. NCBI response: {problem or data}")
+    return int(data["count"]), data["webenv"], data["querykey"]
 
 
 def parse_pubdate(article_elem) -> str | None:
@@ -148,20 +113,9 @@ def parse_pubdate(article_elem) -> str | None:
     return f"{year}-{month}"
 
 
-def efetch_batch(pmids: list[str]) -> list[dict]:
-    params = {
-        "db": "pubmed",
-        "id": ",".join(pmids),
-        "retmode": "xml",
-        "rettype": "abstract",
-    }
-    if get_api_key():
-        params["api_key"] = get_api_key()
-
-    r = requests.get(f"{EUTILS_BASE}/efetch.fcgi", params=params, timeout=60)
-    r.raise_for_status()
-    root = ET.fromstring(r.content)
-
+def parse_efetch_xml(content: bytes) -> list[dict]:
+    """Parse an efetch PubMed XML response into {id, date, text} records."""
+    root = ET.fromstring(content)
     records = []
     for article in root.findall(".//PubmedArticle"):
         pmid = article.findtext(".//PMID")
@@ -171,6 +125,29 @@ def efetch_batch(pmids: list[str]) -> list[dict]:
         if text and date:
             records.append({"id": pmid, "date": date, "text": text})
     return records
+
+
+def efetch_from_history(webenv: str, query_key: str, retstart: int, retmax: int) -> list[dict]:
+    """Fetch one page of records directly from the history server.
+
+    Unlike esearch, efetch from history has no 9,999-record limit, so this pages
+    through arbitrarily large result sets via retstart/retmax.
+    """
+    params = {
+        "db": "pubmed",
+        "WebEnv": webenv,
+        "query_key": query_key,
+        "retstart": retstart,
+        "retmax": retmax,
+        "retmode": "xml",
+        "rettype": "abstract",
+    }
+    if get_api_key():
+        params["api_key"] = get_api_key()
+
+    r = requests.get(f"{EUTILS_BASE}/efetch.fcgi", params=params, timeout=120)
+    r.raise_for_status()
+    return parse_efetch_xml(r.content)
 
 
 def main():
@@ -184,23 +161,24 @@ def main():
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    ids = esearch_all_ids(args.query, args.start, args.end)
-    print(f"Found {len(ids)} PMIDs for query.")
+    total, webenv, query_key = esearch_history(args.query, args.start, args.end)
+    print(f"Found {total} records for query.")
 
+    n_written = 0
     with out_path.open("w") as f:
-        for i in tqdm(range(0, len(ids), BATCH_SIZE), desc="efetch batches"):
-            batch = ids[i:i + BATCH_SIZE]
+        for retstart in tqdm(range(0, total, BATCH_SIZE), desc="efetch batches"):
             try:
-                records = efetch_batch(batch)
+                records = efetch_from_history(webenv, query_key, retstart, BATCH_SIZE)
             except requests.HTTPError as e:
-                print(f"batch {i} failed: {e}, retrying once after backoff")
+                print(f"batch at retstart={retstart} failed: {e}, retrying once after backoff")
                 time.sleep(2)
-                records = efetch_batch(batch)
+                records = efetch_from_history(webenv, query_key, retstart, BATCH_SIZE)
             for rec in records:
                 f.write(json.dumps(rec) + "\n")
+                n_written += 1
             rate_limit_sleep()
 
-    print(f"Wrote records to {out_path}")
+    print(f"Wrote {n_written} records to {out_path}")
 
 
 if __name__ == "__main__":
