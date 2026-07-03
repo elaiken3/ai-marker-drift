@@ -1,0 +1,41 @@
+# Markers to track. Each entry is matched case-insensitively.
+# type: "punct" markers are counted as raw character/token occurrences.
+# type: "phrase" markers are matched as substrings on lowercased text
+#   (simple and fast; swap for regex word-boundaries if you see false positives,
+#   e.g. "nuance" matching inside "nuanced" is usually fine, "delve" inside a
+#   proper noun would not be).
+
+punct:
+  - em_dash        # — (U+2014)
+  - semicolon      # ;
+
+phrases:
+  - delve
+  - delves
+  - underscore
+  - underscores
+  - boast
+  - boasts
+  - meticulous
+  - meticulously
+  - tapestry
+  - navigate the landscape
+  - it is important to note
+  - it's important to note
+  - in conclusion
+  - moreover
+  - furthermore
+  - crucial
+  - realm
+  - multifaceted
+  - nuanced
+
+# Negative controls: words with no AI association. If these show a "break"
+# at Nov 2022 too, the signal is corpus drift, not AI. A clean result means
+# markers break and controls don't.
+controls:
+  - however
+  - although
+  - results
+  - during
+  - between

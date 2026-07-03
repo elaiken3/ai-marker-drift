@@ -1,0 +1,35 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Pixi (if you switch to it later)
+.pixi/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Data: raw corpus pulls are large and reproducible from the ingest scripts.
+# Processed monthly CSVs are small and are your actual results -- keep them versioned.
+data/raw/*
+!data/raw/.gitkeep
+
+# Notebooks: checkpoints only, keep the notebooks themselves
+.ipynb_checkpoints/
+
+# Environment / secrets (NCBI_API_KEY, future NYT/Guardian keys)
+.env
+.env.*
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Claude Code local settings
+.claude/settings.local.json
