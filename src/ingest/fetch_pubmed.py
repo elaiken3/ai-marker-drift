@@ -7,9 +7,13 @@ with one (set NCBI_API_KEY env var to use a key).
 
 NCBI only lets you retrieve the first ~9,999 records of any query (retstart is
 capped), so the query date range is recursively bisected until each slice is
-under the cap. Work is checkpointed per calendar month into a `{out}.parts/`
-directory (one shard per completed month) and concatenated into `--out` at the
-end -- so an interrupted pull resumes where it left off instead of restarting.
+under the cap. The window filters on `--datetype` (default 'edat', the Entrez
+index date, which is spread evenly day-to-day; 'pdat' piles year-only records
+onto Jan 1, making single days overflow the cap). Each record's `date` field is
+still its actual publication date from the XML regardless of --datetype. Work is
+checkpointed per calendar month into a `{out}.parts/` directory (one shard per
+completed month) and concatenated into `--out` at the end -- so an interrupted
+pull resumes where it left off instead of restarting.
 
 Output: one JSON object per line (jsonl) with fields:
     {"id": pmid, "date": "YYYY-MM-DD" or "YYYY-MM", "text": abstract_text}
@@ -47,6 +51,41 @@ def rate_limit_sleep():
     time.sleep(0.11 if get_api_key() else 0.35)
 
 
+# Transport-level failures that are worth retrying (NCBI truncating a response
+# mid-stream, dropped connections, timeouts). These are RequestException
+# subclasses but NOT HTTPError, so a bare `except HTTPError` misses them.
+TRANSIENT_ERRORS = (
+    requests.exceptions.ConnectionError,
+    requests.exceptions.Timeout,
+    requests.exceptions.ChunkedEncodingError,
+)
+
+
+def http_get(endpoint: str, params: dict, timeout: int, retries: int = 4) -> requests.Response:
+    """GET an E-utilities endpoint, retrying transient failures with backoff.
+
+    Retries on dropped/truncated connections and on 5xx/429 responses. Does NOT
+    retry other 4xx -- in particular the deterministic 400 that NCBI returns for
+    retstart past its cap, which the bisection logic in fetch_date_range relies
+    on failing fast.
+    """
+    last_err = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(f"{EUTILS_BASE}/{endpoint}", params=params, timeout=timeout)
+            r.raise_for_status()
+            return r
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response is not None else None
+            if status is not None and status != 429 and status < 500:
+                raise  # deterministic client error (e.g. 400 cap) -- don't retry
+            last_err = e
+        except TRANSIENT_ERRORS as e:
+            last_err = e
+        time.sleep(2 ** attempt)
+    raise RuntimeError(f"E-utilities {endpoint} failed after {retries} attempts: {last_err}")
+
+
 def eutils_get_json(endpoint: str, params: dict, retries: int = 3) -> dict:
     """GET an E-utilities endpoint and parse JSON tolerantly.
 
@@ -58,8 +97,7 @@ def eutils_get_json(endpoint: str, params: dict, retries: int = 3) -> dict:
     """
     last_err = None
     for attempt in range(retries):
-        r = requests.get(f"{EUTILS_BASE}/{endpoint}", params=params, timeout=30)
-        r.raise_for_status()
+        r = http_get(endpoint, params, timeout=30)
         try:
             return json.loads(r.text, strict=False)
         except json.JSONDecodeError as e:
@@ -70,7 +108,7 @@ def eutils_get_json(endpoint: str, params: dict, retries: int = 3) -> dict:
     )
 
 
-def esearch_history(query: str, start: str, end: str) -> tuple[int, str, str]:
+def esearch_history(query: str, start: str, end: str, datetype: str = "edat") -> tuple[int, str, str]:
     """Post the query to NCBI's history server and return (total, WebEnv, query_key).
 
     We deliberately do NOT page esearch to collect PMIDs: esearch can only reach
@@ -78,11 +116,16 @@ def esearch_history(query: str, start: str, end: str) -> tuple[int, str, str]:
     with more results than that cannot be fully listed this way. Instead we store
     the result set on the history server and efetch straight from it (see
     efetch_from_history), which has no such ceiling.
+
+    `datetype` is the date field the mindate/maxdate window filters on. Default
+    'edat' (Entrez index date) is roughly uniform day-to-day; 'pdat' (publication
+    date) piles year-only records onto Jan 1, producing single-day buckets far
+    above the retrieval cap that cannot be sliced smaller.
     """
     params = {
         "db": "pubmed",
         "term": query,
-        "datetype": "pdat",
+        "datetype": datetype,
         "mindate": start,
         "maxdate": end,
         "retmode": "json",
@@ -156,8 +199,7 @@ def efetch_from_history(webenv: str, query_key: str, retstart: int, retmax: int)
     if get_api_key():
         params["api_key"] = get_api_key()
 
-    r = requests.get(f"{EUTILS_BASE}/efetch.fcgi", params=params, timeout=120)
-    r.raise_for_status()
+    r = http_get("efetch.fcgi", params, timeout=120)
     return parse_efetch_xml(r.content)
 
 
@@ -166,12 +208,7 @@ def _fetch_small_slice(webenv: str, query_key: str, count: int, out_handle) -> i
     n = 0
     cap = min(count, MAX_SLICE)
     for retstart in range(0, cap, BATCH_SIZE):
-        try:
-            records = efetch_from_history(webenv, query_key, retstart, BATCH_SIZE)
-        except requests.HTTPError as e:
-            print(f"  efetch at retstart={retstart} failed: {e}, retrying once after backoff")
-            time.sleep(2)
-            records = efetch_from_history(webenv, query_key, retstart, BATCH_SIZE)
+        records = efetch_from_history(webenv, query_key, retstart, BATCH_SIZE)
         for rec in records:
             out_handle.write(json.dumps(rec) + "\n")
             n += 1
@@ -179,12 +216,13 @@ def _fetch_small_slice(webenv: str, query_key: str, count: int, out_handle) -> i
     return n
 
 
-def fetch_date_range(query: str, day0: datetime.date, day1: datetime.date, out_handle) -> int:
+def fetch_date_range(query: str, day0: datetime.date, day1: datetime.date,
+                     out_handle, datetype: str = "edat") -> int:
     """Recursively fetch [day0, day1] (inclusive), bisecting the date range until
     each slice is under NCBI's retrieval cap. Writes records to out_handle;
     returns the number written."""
     start_s, end_s = day0.isoformat(), day1.isoformat()
-    count, webenv, query_key = esearch_history(query, start_s, end_s)
+    count, webenv, query_key = esearch_history(query, start_s, end_s, datetype)
     if count == 0:
         return 0
     if count <= MAX_SLICE:
@@ -199,8 +237,8 @@ def fetch_date_range(query: str, day0: datetime.date, day1: datetime.date, out_h
         return _fetch_small_slice(webenv, query_key, MAX_SLICE, out_handle)
     mid = day0 + datetime.timedelta(days=(day1 - day0).days // 2)
     return (
-        fetch_date_range(query, day0, mid, out_handle)
-        + fetch_date_range(query, mid + datetime.timedelta(days=1), day1, out_handle)
+        fetch_date_range(query, day0, mid, out_handle, datetype)
+        + fetch_date_range(query, mid + datetime.timedelta(days=1), day1, out_handle, datetype)
     )
 
 
@@ -223,6 +261,12 @@ def main():
     ap.add_argument("--start", required=True, help="YYYY-MM-DD")
     ap.add_argument("--end", required=True, help="YYYY-MM-DD")
     ap.add_argument("--out", required=True, help="output jsonl path")
+    ap.add_argument(
+        "--datetype", default="edat", choices=["edat", "pdat", "mdat", "crdt"],
+        help="date field the --start/--end window filters on. Default 'edat' "
+             "(Entrez index date) is roughly uniform; 'pdat' (publication date) "
+             "piles year-only records onto Jan 1, overflowing the retrieval cap.",
+    )
     args = ap.parse_args()
 
     out_path = Path(args.out)
@@ -237,7 +281,7 @@ def main():
     parts_dir = Path(str(out_path) + ".parts")
     parts_dir.mkdir(parents=True, exist_ok=True)
     meta_path = parts_dir / "_meta.json"
-    meta = {"query": args.query, "start": args.start, "end": args.end}
+    meta = {"query": args.query, "start": args.start, "end": args.end, "datetype": args.datetype}
     if meta_path.exists():
         prev = json.loads(meta_path.read_text())
         if prev != meta:
@@ -255,7 +299,7 @@ def main():
             continue  # already fetched (resume)
         tmp = parts_dir / f"{label}.jsonl.tmp"
         with tmp.open("w") as f:
-            fetch_date_range(args.query, win_start, win_end, f)
+            fetch_date_range(args.query, win_start, win_end, f, args.datetype)
         os.replace(tmp, shard)  # atomic: partial months never become shards
 
     # Concatenate month shards (date order) into the single output file.
