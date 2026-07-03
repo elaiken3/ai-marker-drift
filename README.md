@@ -34,8 +34,12 @@ data/processed/        -> monthly frequency tables (parquet/csv)
    Only goes through ~2022 in the public corpus, so it's a *pre-period baseline*,
    not useful for the post-ChatGPT window. Use it to sanity-check your marker
    list against a century of prior trend before you trust anything post-2022.
+3. **Guardian articles** (`src/ingest/fetch_guardian.py`) — the journalism leg
+   of the theory, via the Guardian Open Platform Content API. Free but needs an
+   API key (`GUARDIAN_API_KEY`); free tier is ~1 req/s, 500 req/day. Same
+   `{id, date, text}` jsonl contract, so it drops straight into the analysis step.
 
-Not yet wired up (see CLAUDE.md for notes): NYT API, Guardian API, arXiv bulk dumps,
+Not yet wired up (see CLAUDE.md for notes): NYT API, arXiv bulk dumps,
 Common Crawl. Each needs its own ingest script following the same
 `(text, pub_date, source_id)` contract so they drop into the same analysis step.
 
@@ -48,7 +52,15 @@ python src/ingest/fetch_pubmed.py --query "cancer AND treatment" \
 python src/analysis/extract_features.py --in data/raw/pubmed_cancer.jsonl \
     --out data/processed/pubmed_cancer_monthly.csv
 python src/analysis/regression_discontinuity.py \
-    --in data/processed/pubmed_cancer_monthly.csv --breakpoint 2022-11-30
+    --in data/processed/pubmed_cancer_monthly.csv --marker em_dash --breakpoint 2022-11-30
+# optional: let the data place the break instead of hypothesizing a date
+python src/analysis/detect_breaks.py \
+    --in data/processed/pubmed_cancer_monthly.csv --marker em_dash --n-breaks 1
 ```
+
+`extract_features.py` also emits per-month quantiles of the *per-document*
+frequency distribution (`{marker}_pQQ_per_1k_words`), for testing the H2
+avoidance hypothesis on the right tail — e.g. `--marker em_dash_p90` feeds the
+90th-percentile series straight into `regression_discontinuity.py`.
 
 See `CLAUDE.md` for current state and what's left to build.
