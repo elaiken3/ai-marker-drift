@@ -92,10 +92,35 @@ def esearch_all_ids(query: str, start: str, end: str) -> list[str]:
         }
         if get_api_key():
             params["api_key"] = get_api_key()
-        ids.extend(eutils_get_json("esearch.fcgi", params)["esearchresult"]["idlist"])
+        ids.extend(esearch_page_idlist(params, retstart))
         rate_limit_sleep()
 
     return ids
+
+
+def esearch_page_idlist(params: dict, retstart: int, retries: int = 4) -> list[str]:
+    """Fetch one page of PMIDs, retrying transient NCBI errors.
+
+    Occasionally NCBI returns an esearchresult with no 'idlist' -- an ERROR or
+    WarningList payload instead of results -- even when the query is valid.
+    Retry those with backoff; if it persists, raise with NCBI's own message so
+    the failure is diagnosable instead of a bare KeyError.
+    """
+    result = {}
+    for attempt in range(retries):
+        result = eutils_get_json("esearch.fcgi", params)["esearchresult"]
+        if "idlist" in result:
+            return result["idlist"]
+        time.sleep(2 ** attempt)
+    problem = {
+        k: result[k]
+        for k in ("ERROR", "WarningList", "warninglist", "ERRORLIST", "errorlist")
+        if k in result
+    }
+    raise RuntimeError(
+        f"esearch page at retstart={retstart} returned no idlist after {retries} "
+        f"attempts. NCBI response: {problem or result}"
+    )
 
 
 def parse_pubdate(article_elem) -> str | None:
