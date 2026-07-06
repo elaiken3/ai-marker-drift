@@ -38,6 +38,16 @@ Verified working end-to-end on synthetic data:
   negative control survives correction (= corpus drift, not AI). Skips
   constant/all-zero series (degenerate Wald otherwise). Verified on
   synthetic data: injected markers significant post-BH, control not.
+- `src/analysis/marker_vs_control.py` — drift-adjusted (difference-in-differences)
+  test for when controls DO break (as they do on real PubMed data). Standardizes
+  each series' level jump by its pre-break SD, builds a "drift band" from the
+  controls' standardized effects, and flags only markers whose break clears the
+  band (|z| >= threshold AND larger than every control), preserving sign
+  (up = H1 adoption, down = H2 avoidance). This is the headline test once
+  run_all_markers shows corpus-wide drift; single break-significance is not
+  enough. Verified on synthetic data: recovers injected markers that exceed the
+  control band, and correctly reports "no signal" when markers move at
+  control magnitude.
 
 Not yet run against real data:
 - `src/ingest/fetch_pubmed.py` — written against the documented NCBI
