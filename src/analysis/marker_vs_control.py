@@ -57,6 +57,10 @@ def main():
     ap.add_argument("--out", default=None, help="optional CSV path for the table")
     ap.add_argument("--z-threshold", type=float, default=2.0,
                     help="|z| above the control band to call a marker a standout")
+    ap.add_argument("--min-count", type=int, default=1000,
+                    help="minimum total occurrences for a series to be analyzed; "
+                         "rarer markers/controls are set aside as unreliable "
+                         "(standardizing a near-zero series inflates tiny blips)")
     args = ap.parse_args()
 
     with open(args.markers) as f:
@@ -68,6 +72,7 @@ def main():
     df = pd.read_csv(args.infile)
     design = build_design(df, pd.Timestamp(args.breakpoint))
 
+    total_words = df["n_words"].to_numpy() if "n_words" in df.columns else None
     rows = []
     for name in marker_names + control_names:
         y_col = f"{name}_per_1k_words"
@@ -76,9 +81,17 @@ def main():
         level_jump, pre_mean, pre_sd = series_effect(design, y_col)
         if not pre_sd or pre_sd <= 0 or np.isnan(pre_sd):
             continue  # can't standardize a flat/degenerate pre-period
+        raw_col = f"{name}_raw"
+        if raw_col in df.columns:
+            total_count = int(df[raw_col].sum())
+        elif total_words is not None:
+            total_count = int((df[y_col].to_numpy() * total_words / 1000).sum())
+        else:
+            total_count = None
         rows.append({
             "marker": name,
             "is_control": name in control_set,
+            "total_count": total_count,
             "level_jump": level_jump,
             "pre_mean": pre_mean,
             "rel_jump_pct": 100 * level_jump / pre_mean if pre_mean else float("nan"),
@@ -86,21 +99,27 @@ def main():
         })
 
     res = pd.DataFrame(rows)
-    if res.empty or not res["is_control"].any():
-        raise SystemExit("Need at least one usable control series to form a drift band.")
+    if res.empty:
+        raise SystemExit("No usable series found in the input.")
 
-    control_eff = res.loc[res["is_control"], "std_effect"].to_numpy()
+    # Set aside series too rare to analyze -- standardizing a near-zero series
+    # turns a handful of occurrences into a huge "effect" (e.g. a word appearing
+    # ~1x/month). These are reported separately, never flagged as signal.
+    res["low_count"] = res["total_count"].notna() & (res["total_count"] < args.min_count)
+    reliable = ~res["low_count"]
+
+    ctrl_mask = res["is_control"] & reliable
+    control_eff = res.loc[ctrl_mask, "std_effect"].to_numpy()
     if len(control_eff) < 2:
         raise SystemExit(
-            f"Only {len(control_eff)} usable control(s); need >=2 to estimate a "
-            "drift band. Add more controls in the markers config."
+            f"Only {len(control_eff)} control(s) with >= {args.min_count} occurrences; "
+            "need >=2 to estimate a drift band. Lower --min-count or add controls."
         )
     band_mean = float(control_eff.mean())
     band_sd = float(control_eff.std(ddof=1))
     max_ctrl_abs = float(np.abs(control_eff).max())
-    strongest_ctrl = res.loc[res["is_control"]].iloc[
-        int(np.argmax(np.abs(control_eff)))
-    ]["marker"]
+    reliable_ctrls = res.loc[ctrl_mask]
+    strongest_ctrl = reliable_ctrls.iloc[int(np.argmax(np.abs(control_eff)))]["marker"]
 
     res["z_vs_controls"] = (res["std_effect"] - band_mean) / band_sd
     res["beats_controls"] = res["std_effect"].abs().apply(
@@ -108,30 +127,39 @@ def main():
     )
     res["direction"] = np.where(res["std_effect"] >= 0, "up (H1)", "down (H2)")
     # A marker is a candidate signal only if it clears the band both ways:
-    # far from the control mean AND larger than every individual control.
+    # far from the control mean AND larger than every individual control --
+    # and only if it has enough occurrences to be reliable.
     res["exceeds_drift"] = (
         (~res["is_control"])
+        & reliable
         & (res["z_vs_controls"].abs() >= args.z_threshold)
         & (res["std_effect"].abs() > max_ctrl_abs)
     )
 
-    markers = res[~res["is_control"]].copy()
-    markers = markers.reindex(markers["std_effect"].abs().sort_values(ascending=False).index)
-    controls = res[res["is_control"]].copy()
-    controls = controls.reindex(controls["std_effect"].abs().sort_values(ascending=False).index)
+    def by_abs_effect(frame):
+        return frame.reindex(frame["std_effect"].abs().sort_values(ascending=False).index)
 
-    cols = ["marker", "level_jump", "pre_mean", "rel_jump_pct", "std_effect",
-            "z_vs_controls", "beats_controls", "direction", "exceeds_drift"]
+    markers = by_abs_effect(res[(~res["is_control"]) & reliable])
+    controls = by_abs_effect(res[res["is_control"] & reliable])
+    excluded = by_abs_effect(res[res["low_count"]])
+
+    cols = ["marker", "total_count", "level_jump", "pre_mean", "rel_jump_pct",
+            "std_effect", "z_vs_controls", "beats_controls", "direction", "exceeds_drift"]
     n_ctrl = len(control_eff)
     pd.set_option("display.float_format", lambda v: f"{v:.4f}")
 
-    print(f"\nBreakpoint: {args.breakpoint} | {n_ctrl} controls in drift band")
+    print(f"\nBreakpoint: {args.breakpoint} | {n_ctrl} controls in drift band "
+          f"| min-count = {args.min_count}")
     print(f"Control drift band (standardized effect): mean={band_mean:.3f}, "
           f"sd={band_sd:.3f}; strongest control = {strongest_ctrl} (|effect|={max_ctrl_abs:.3f})")
     print("\n=== MARKERS (sorted by |standardized effect|) ===")
     print(markers[cols].to_string(index=False))
     print("\n=== CONTROLS (the drift baseline) ===")
     print(controls[cols[:-1]].to_string(index=False))
+    if not excluded.empty:
+        print(f"\n=== EXCLUDED: fewer than {args.min_count} occurrences (too rare to "
+              f"analyze; standardized effect is unreliable) ===")
+        print(excluded[["marker", "is_control", "total_count", "pre_mean"]].to_string(index=False))
 
     standouts = markers[markers["exceeds_drift"]]
     print()

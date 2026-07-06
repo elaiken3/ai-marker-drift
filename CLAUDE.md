@@ -47,7 +47,11 @@ Verified working end-to-end on synthetic data:
   run_all_markers shows corpus-wide drift; single break-significance is not
   enough. Verified on synthetic data: recovers injected markers that exceed the
   control band, and correctly reports "no signal" when markers move at
-  control magnitude.
+  control magnitude. Has a `--min-count` guard (default 1000 total occurrences):
+  near-zero series are set aside as "unreliable" instead of topping the table,
+  because standardizing an almost-always-zero series turns a handful of
+  occurrences into a huge fake effect (e.g. `delve` at ~1/month showing
+  "+3328%").
 
 Not yet run against real data:
 - `src/ingest/fetch_pubmed.py` — written against the documented NCBI
@@ -77,6 +81,27 @@ Google Ngram, and `content.guardianapis.com` all return proxy 403. So every
 *live* corpus pull remains untested here; run those from a machine/session with
 open network access. `ruptures` installs fine from PyPI, so detect_breaks was
 verified for real.
+
+## Findings so far (first real PubMed run, ~882k abstracts 2020-2026, edat-sliced)
+- Corpus-wide drift is real: all negative controls show significant Nov-2022
+  breaks in run_all_markers, so single break-significance means nothing here.
+  marker_vs_control is the test that matters.
+- Only genuinely-common markers can be trusted (see the --min-count guard).
+  After excluding rare ones, `crucial` is the clearest standout: ~+57% vs a
+  ~0.13/1k baseline, beats all 5 controls (H1/adoption). Other common formal
+  connectives (`furthermore` +24%, `moreover`, `in conclusion`) drift up too but
+  sit just under the |z|>=2 bar; `semicolon` drifts down ~-12%. Suggestive
+  family-level signal, not a slam dunk.
+- Em dash is UNUSABLE in PubMed: only ~413 of 882k abstracts (0.05%) contain a
+  literal em dash (double-hyphen equally rare, so it's not an encoding bug —
+  formal abstract style just avoids them). The flagship "AI em-dash" marker
+  can't be studied in edited academic prose; this is the main reason to pull the
+  Guardian (journalism) corpus next, where em dashes are actually used.
+- Known data-quality caveat still open: parse_efetch_xml uses `a.text`, which
+  truncates AbstractText at the first inline-markup child (`<i>`, `<sup>`...),
+  dropping trailing text. Switching to `"".join(a.itertext())` would fix it but
+  requires a re-pull (the jsonl already holds the truncated text). Unquantified;
+  likely small but affects word counts and all markers, not just em dash.
 
 ## Immediate next steps (in priority order)
 1. Run `fetch_pubmed.py` on a small query/date range first (e.g. one month)
